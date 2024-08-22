@@ -1,4 +1,4 @@
-# precision_RHI
+# Precision not Prediction: Rubber Hand Illusion and Body Ownership
 The code to model RHI using online precision learning and model selection under free energy principle
 
 
