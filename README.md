@@ -1,4 +1,4 @@
-# rubber_hand_illusion
+# precision_RHI
 The code to model RHI using online precision learning and model selection under free energy principle
 
 
