@@ -6,8 +6,6 @@ MATLAB code reproducing every figure of
 > *Online precision adaptation to model body-ownership illusion dynamics under
 > Bayesian inference.*
 
-[![checks](https://github.com/ajitham123/precision_RHI/actions/workflows/checks.yml/badge.svg)](https://github.com/ajitham123/precision_RHI/actions/workflows/checks.yml)
-
 The model treats the rubber hand illusion as a consequence of uncertainty
 minimisation. An agent holds two hypotheses about the world — *M₁*, "my hand is
 my real hand", and *M₂*, "my hand is the rubber hand" — learns the precision
