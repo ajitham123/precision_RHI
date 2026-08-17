@@ -1,0 +1,1195 @@
+From 46442d370e356b649a6d56a9b4c41ebc9eaf368a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 17 Aug 2026 14:00:36 +0000
+Subject: [PATCH 1/3] Add parameter sensitivity analysis (Figs. 9-11)
+
+Answers the reviewer question that the paper currently deflects: how much of
+the ownership switch is the mechanism and how much is the particular numbers
+in Appendix 5.1. Each free parameter is scaled (gains, precisions) or biased
+(log-precisions) away from its published value while M1 and M2 stay exactly as
+published, and the switch is detected again.
+
+  switch_metrics  requires M1 to be the experienced hypothesis for the whole
+                  visible period AND M2 to take over for at least 1 s after
+                  covering, so an agent that was illusory from the start does
+                  not count as having switched. The zero crossing is
+                  interpolated so the switch time is not quantised to dt.
+  Fig. 9          one parameter at a time, 10 noise realisations per point
+  Fig. 10         all six perturbed at once, 300 random parameter sets
+  Fig. 11         four parameters, four switches, for the appendix
+
+Results: the switch survives x0.25-x2 of k_lam, x0.1-x100 of k_state,
+x0.01-x10 of P_X, +/-4 of eta_lam, x0.01-x100 of P_lam(Av) and -4..+6 of
+lam_covered(Av), and 298/300 joint perturbations. It has three limits, each
+mechanistically interpretable: too fast a precision learner is illusory before
+covering, too strong a prior on the Av precision prevents the switch (the
+continuous version of Fig. 4), and too mild an occlusion never triggers it.
+
+Figs. 2-8 are untouched, and simulate() is verified bit-identical across 24
+configurations. P_X was hardcoded as eye(n) inside simulate and so could not
+be swept; it is now p.P_X, defaulting to 1, which reproduces eye(n) exactly.
+Structs without the field still run.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UfwYpwGVozHGhaYv68cWf3
+---
+ README.md       |  46 +++-
+ precision_RHI.m | 554 ++++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 584 insertions(+), 16 deletions(-)
+
+diff --git a/README.md b/README.md
+index 6aabefc..5d6f4de 100644
+--- a/README.md
++++ b/README.md
+@@ -43,10 +43,14 @@ Requires MATLAB R2017a or newer (for `smoothdata`). No toolboxes — in
+ particular, no Symbolic Math Toolbox.
+ 
+ ```matlab
+-precision_RHI          % all figures, ~30 s
++precision_RHI          % all figures
+ precision_RHI(2,5,8)   % just these
+ ```
+ 
++Figures 2-8 take ~30 s. Figures 9-11 sweep the parameters and re-run the
++trial a few thousand times, which adds a couple of minutes; ask for
++`precision_RHI(2:8)` to skip them.
++
+ For a single condition:
+ 
+ ```matlab
+@@ -66,6 +70,46 @@ s = f.simulate(p);       plot(s.t, s.Xh(4,:))
+ | 6 | drift appears under `M2`, not under `M1` |
+ | 7 | a farther rubber hand gives a larger drift |
+ | 8 | drift vs. distance and susceptibility `α` |
++| 9 | the switch survives each parameter being scaled or biased, and where it stops |
++| 10 | ... and survives all of them being perturbed at once |
++| 11 | four parameters, four switches, side by side |
++
++## Parameter sensitivity
++
++Figures 9-11 exist to answer the obvious question about a model with this
++many free parameters: how much of the result is the mechanism and how much is
++the particular numbers in Appendix 5.1?
++
++Every free parameter is scaled (gains and precisions) or biased (the
++log-precisions) away from its published value while `M1` and `M2` stay exactly
++as published, and the switch is detected again — `switch_metrics` requires
++`M1` to be the experienced hypothesis for the whole visible period and `M2` to
++take over for at least a second once the hand is covered, so a model that was
++illusory from the start does not count as having switched.
++
++In Fig. 9 the line is the mean switch time over 10 noise realisations and the
++ribbon is ±1 s.d.; the strip along the bottom of each panel marks grid points
++where every realisation switched (filled square), only some did (hollow) or
++none did (grey cross). Fig. 11 adds a second row showing `U(M1) - U(M2)`,
++because the two uncertainty curves are only ~0.05 apart before covering and
++~0.5 apart after it, so on a shared axis the crossing itself is invisible.
++
++The switch is preserved over a wide range of every parameter, and it also has
++limits, which are as informative as the robustness:
++
++| | |
++|---|---|
++| `k_lam` above ~2.8× | `M2` gets ahead *before* the hand is covered — a fast enough precision learner is illusory from the start |
++| `P_lam` on `Av` above ~1e3× | the agent cannot revise its estimate of visual reliability, so no switch — the continuous version of Fig. 4 |
++| `lam_covered` on `Av` above ~+7 | the occlusion is too mild to register as a precision change |
++| `k_state` below ~0.01×, `P_X` above ~100× | state estimation is too slow, resp. the state prior swamps the sensory evidence |
++
++Note that `k_state` and `P_X` do nothing at all near their published values,
++and this is not a numerical accident: `expm(K_X*H*p.dt)` in `simulate` has
++already underflowed to zero there, so the state update *is* the exact Newton
++step and its gain cannot matter, and `P_X = 1` is added to an `M'*Pz*M` whose
++entries are of order `1e3`. Both need sweeping over orders of magnitude before
++they bite, which is what `sensitivity_spec` does.
+ 
+ ## Code layout
+ 
+diff --git a/precision_RHI.m b/precision_RHI.m
+index 32d1724..8c1266a 100644
+--- a/precision_RHI.m
++++ b/precision_RHI.m
+@@ -11,7 +11,7 @@ function api = precision_RHI(varargin)
+ %   p = f.default_params();  p.Ry = 2;  p.brain = 'M2';
+ %   s = f.simulate(p);       plot(s.t, s.Xh(4,:))
+ %
+-% Reproduces Figs. 2-8 of Novicky, Anil Meera, Zeldenrust & Lanillos,
++% Reproduces Figs. 2-11 of Novicky, Anil Meera, Zeldenrust & Lanillos,
+ % "Online precision adaptation to model body-ownership illusion dynamics
+ % under Bayesian inference".
+ %
+@@ -43,39 +43,49 @@ function api = precision_RHI(varargin)
+ % is experienced (Eq. 5). While the hand is visible that is M1; once Av goes
+ % noisy, precision learning down-weights Av, M1 loses its grip on the hand
+ % position, and M2 takes over -- the illusion.
++%
++% Figs. 9-11 ask how much of this depends on the particular numbers in
++% default_params: each free parameter is scaled or biased away from its
++% published value, with M1 and M2 held fixed, and the switch is re-detected.
+ % -------------------------------------------------------------------------
+ 
+ % Hand back the internals if asked, so a single run can be scripted.
+ if nargin == 1 && ischar(varargin{1})
+     if strcmpi(varargin{1}, 'api')
+-        api = struct('default_params', @default_params, ...
+-                     'simulate',       @simulate, ...
+-                     'hypotheses',     @hypotheses);
++        api = struct('default_params',   @default_params, ...
++                     'simulate',         @simulate, ...
++                     'hypotheses',       @hypotheses, ...
++                     'switch_metrics',   @switch_metrics, ...
++                     'perturb',          @perturb, ...
++                     'sensitivity_spec', @sensitivity_spec);
+         return
+     end
+     error('precision_RHI: unknown option ''%s''. Use figure numbers or ''api''.', ...
+           varargin{1});
+ end
+ 
+-figs = [2 3 4 5 6 7 8];
++figs = [2 3 4 5 6 7 8 9 10 11];
+ if nargin > 0
+     figs = cell2mat(varargin);
+ end
+ 
+ for f = reshape(figs, 1, [])
+-    if ~ismember(f, 2:8)
+-        warning('precision_RHI: there is no figure %d (valid: 2-8)', f);
++    if ~ismember(f, 2:11)
++        warning('precision_RHI: there is no figure %d (valid: 2-11)', f);
+         continue
+     end
+     fprintf('Figure %d ...\n', f);
+     switch f
+-        case 2, fig2_perceptual_switch();
+-        case 3, fig3_precision_adaptation();
+-        case 4, fig4_broken_precision();
+-        case 5, fig5_switch_vs_distance();
+-        case 6, fig6_drift_in_M1_and_M2();
+-        case 7, fig7_drift_vs_distance();
+-        case 8, fig8_drift_vs_alpha_and_distance();
++        case 2,  fig2_perceptual_switch();
++        case 3,  fig3_precision_adaptation();
++        case 4,  fig4_broken_precision();
++        case 5,  fig5_switch_vs_distance();
++        case 6,  fig6_drift_in_M1_and_M2();
++        case 7,  fig7_drift_vs_distance();
++        case 8,  fig8_drift_vs_alpha_and_distance();
++        case 9,  fig9_sensitivity_sweep();
++        case 10, fig10_sensitivity_joint();
++        case 11, fig11_sensitivity_examples();
+     end
+     drawnow;
+ end
+@@ -110,6 +120,12 @@ p.P_lam   = exp(-4) * [1;1;1;1];   % prior precision on lambda (diagonal).
+ p.k_lam   = 4;                     % learning rate for lambda
+ p.k_state = [4 4 4 4];             % learning rate per state
+ 
++p.P_X     = 1;                     % prior precision on the states, as a
++                                   % multiple of the identity. 1 is the value
++                                   % used throughout the paper; it is a
++                                   % parameter of the model rather than a
++                                   % constant, so Fig. 9 sweeps it too.
++
+ p.seed = 12;                       % fixed noise realisation
+ 
+ p.drift_window = [];               % window over which the drift is averaged.
+@@ -172,7 +188,11 @@ Y(:,1)   = 0;                             % first sample is only an initialiser
+ 
+ % ---- agent -------------------------------------------------------------
+ P_lam = diag(p.P_lam);                    % prior precision on lambda
+-P_X   = eye(n);                           % prior precision on the states
++if isfield(p, 'P_X')                      % prior precision on the states
++    P_X = p.P_X * eye(n);                 %   (p.P_X = 1 -> eye(n), as published)
++else
++    P_X = eye(n);
++end
+ K_lam = p.k_lam * eye(n);
+ K_X   = diag(p.k_state);
+ I     = eye(n);
+@@ -450,6 +470,378 @@ set(gca, 'fontsize', 12); box off;
+ end
+ 
+ 
++% =========================================================================
++%  PARAMETER SENSITIVITY
++% =========================================================================
++
++function spec = sensitivity_spec()
++%SENSITIVITY_SPEC  The free parameters perturbed in Figs. 9-11.
++%
++% One row per parameter: its name, how a perturbation is applied to it, the
++% grid Fig. 9 sweeps it over, and an axis label.
++%
++% Gains and precisions are strictly positive, so they are perturbed
++% multiplicatively ('mul', where 1 is the published value). The lambdas are
++% already log-precisions, so for those the natural perturbation is a bias
++% ('add', where 0 is the published value).
++%
++% The mapping matrices M1 and M2 (Eqs. 3 and 4) are deliberately NOT on this
++% list. The claim being tested is that one fixed pair of hypotheses produces
++% the ownership switch across a wide range of the free parameters, so the
++% mapping is held exactly as published throughout.
++%
++% Where a parameter has a breakdown point the grid is made wide enough to
++% contain it, which for four of the six means a logarithmic sweep over many
++% orders of magnitude rather than a couple of octaves.
++%
++% k_x and P_x need such a sweep for a specific reason. In the published
++% regime the state update has already saturated: K_x*H*dt has eigenvalues of
++% order -1e3, so expm(K_x*H*p.dt) in simulate underflows to zero and the
++% update is exactly the Newton step -- k_x cannot influence it at all.
++% Likewise P_x = 1 is added to an M'*Pz*M whose entries are of order 1e3, so
++% it is negligible unless raised by orders of magnitude. Sweeping either over
++% two octaves would produce a flat line for an uninteresting reason.
++%
++% The last column gives the tick positions explicitly. Several of the grids
++% span eight or more decades, and letting MATLAB label every one of them puts
++% the tick labels on top of each other in a subplot this size.
++%
++%        name          kind   sweep grid       axis label                        ticks
++spec = { 'k_lam',      'mul', 2.^(-2:0.5:2),  'k_\lambda  (\times published)',   [0.25 0.5 1 2 4]
++         'k_state',    'mul', 10.^(-5:2),     'k_x  (\times published)',         10.^(-5:2:1)
++         'P_X',        'mul', 10.^(-2:8),     'P_x  (\times published)',         10.^(-2:2:8)
++         'eta_lam',    'add', -4:4,           '\eta_\lambda  (bias)',            -4:2:4
++         'P_lam_Av',   'mul', 10.^(-2:8),     'P_\lambda^{Av}  (\times published)', 10.^(-2:2:8)
++         'lam_cov_Av', 'add', -4:2:12,        '\lambda^{Av}_{covered}  (bias)',  -4:4:12 };
++end
++
++
++function p = perturb(p, name, v)
++%PERTURB  Apply one perturbation from SENSITIVITY_SPEC to a parameter set.
++%   'mul' parameters are scaled by v, 'add' parameters are offset by v.
++switch name
++    case 'k_lam',      p.k_lam          = p.k_lam          * v;
++    case 'k_state',    p.k_state        = p.k_state        * v;
++    case 'P_X',        p.P_X            = p.P_X            * v;
++    case 'P_lam_Av',   p.P_lam(1)       = p.P_lam(1)       * v;
++    case 'eta_lam',    p.eta_lam        = p.eta_lam        + v;
++    case 'lam_cov_Av', p.lam_covered(1) = p.lam_covered(1) + v;
++    otherwise, error('perturb: unknown parameter ''%s''.', name);
++end
++end
++
++
++function m = switch_metrics(p)
++%SWITCH_METRICS  Detect the ownership switch in one trial.
++%
++% Runs the same trial under both hypotheses and compares the model-selection
++% criterion U (Eq. 5) sample by sample:
++%
++%   d = U(M_1) - U(M_2) > 0   <=>   M_2 is the experienced hypothesis
++%
++% A switch is counted only when BOTH halves hold: M_1 is experienced
++% throughout the visible period, and M_2 then takes over for at least
++% MIN_HOLD seconds. M_2 winning on its own is not an illusion -- it is a
++% model that was illusory from the start -- so both conditions are needed.
++% The persistence requirement also discards the single-sample transient the
++% estimator produces at t = 0, before any data has arrived.
++MIN_HOLD = 1.0;                    % s of sustained M2 dominance required
++WIN_PRE  = [4 12.5];               % hand visible, strokes running
++%
++% WIN_PRE has to end just before the covering starts to take effect, and no
++% earlier. true_lambda smooths the step at t_step with a Gaussian of window
++% nt/5 = 6.4 s, i.e. s.d. 1.28 s, so the believed precision of Av begins to
++% fall around t_step - 2.5 s.d. = 12.7 s. Ending the window earlier than that
++% leaves a gap in which a crossing counts as a switch without the covering
++% having had anything to do with it: at P_x >= 1e3 x published the two
++% hypotheses cross at ~11.4 s, which a window ending at 11 s would score as
++% an illusion. Requiring M1 to lead all the way to 12.5 s scores it, correctly,
++% as an agent that was already illusory before its hand was covered.
++
++q = p;  q.brain = 'M1';  s1 = simulate(q);
++q.brain = 'M2';          s2 = simulate(q);
++
++t  = s1.t;
++nt = numel(t);
++d  = s1.U - s2.U;
++
++% The covering step: the sample at which true_lambda switches over to
++% lam_covered, written the same way as the drift window in simulate. The step
++% is smoothed over nt/5 samples, so the believed precision of Av starts to
++% fall a couple of seconds before this and the switch can slightly precede it.
++m.t_step = (floor(nt/2) - 1) * p.dt;
++
++m.pre_M1 = all(d(tsel(t, WIN_PRE(1), WIN_PRE(2))) < 0);
++
++% First run of at least MIN_HOLD seconds of M2 dominance that starts after
++% the visible period.
++np    = max(2, round(MIN_HOLD / p.dt));
++k0    = find(t > WIN_PRE(2), 1);
++run   = 0;
++first = NaN;
++for i = 1:nt
++    if d(i) > 0, run = run + 1; else, run = 0; end
++    if run >= np && i - np + 1 >= k0 && isnan(first)
++        first = i - np + 1;
++    end
++end
++
++m.occurred = m.pre_M1 && ~isnan(first);
++if m.occurred
++    % Linear interpolation of the zero crossing of d, so that the switch time
++    % is not quantised to the integration step. Without this, parameters whose
++    % influence is smaller than dt produce a staircase.
++    m.t_switch = t(first);
++    if first > 1 && d(first-1) <= 0 && d(first) > d(first-1)
++        m.t_switch = t(first-1) + p.dt * (0 - d(first-1)) / (d(first) - d(first-1));
++    end
++else
++    m.t_switch = NaN;
++end
++m.latency = m.t_switch - m.t_step;                 % relative to the covering
++m.margin  = mean(d(tsel(t, m.t_step, p.T)));       % how decisively M2 wins
++
++m.t = t;  m.U1 = s1.U;  m.U2 = s2.U;  m.d = d;
++end
++
++
++function fig9_sensitivity_sweep()
++%FIG. 9  Parameter sensitivity, one parameter at a time.
++%
++% Each panel scales or biases a single free parameter away from its published
++% value and re-detects the switch, over NSEED noise realisations. The line is
++% the mean switch time, the ribbon +/- 1 s.d.; the strip along the bottom says
++% whether every realisation switched (filled square), some did (hollow) or
++% none did (grey cross). M1 and M2 are unchanged throughout.
++%
++% The band is named in the y-label rather than in a legend: the curve runs
++% through the middle of each panel, so any legend box inside the axes would
++% sit on top of it.
++NSEED = 10;                        % noise realisations per grid point
++
++spec = sensitivity_spec();
++pd   = default_params();
++c    = palette();
++
++figure(9); clf;
++set(gcf, 'position', [80 80 1280 720]);   % room for six sets of axis labels
++fprintf('  Fig. 9  switch preserved for every noise realisation over:\n');
++for i = 1:size(spec,1)
++    name = spec{i,1};  kind = spec{i,2};  gv = spec{i,3};
++    lbl  = spec{i,4};  tks  = spec{i,5};
++    ng   = numel(gv);
++
++    ts  = nan(NSEED, ng);
++    occ = false(NSEED, ng);
++    pre = false(NSEED, ng);
++    for j = 1:ng
++        for k = 1:NSEED
++            p = default_params();
++            p.seed = k;
++            m = switch_metrics(perturb(p, name, gv(j)));
++            occ(k,j) = m.occurred;
++            pre(k,j) = m.pre_M1;
++            ts(k,j)  = m.t_switch;
++        end
++    end
++
++    % Mean and s.d. of the switch time over the realisations that switched.
++    mu = nan(1,ng);  sg = nan(1,ng);
++    for j = 1:ng
++        v = ts(occ(:,j), j);
++        if ~isempty(v), mu(j) = mean(v); sg(j) = std(v); end
++    end
++    frac     = mean(occ, 1);
++    nom      = pick(strcmp(kind,'mul'), 1, 0);
++    [lo, hi] = robust_range(gv, frac, nom);
++
++    subplot(2, 3, i); hold on;
++
++    % Shrink each set of axes upwards a little. The x-labels carry
++    % superscripts and subscripts, which are tall enough that at the default
++    % 2x3 spacing the top row's label lands on the bottom row's title.
++    ps = get(gca, 'position');
++    set(gca, 'position', [ps(1), ps(2) + 0.11*ps(4), ps(3), 0.76*ps(4)]);
++
++    band(gv, mu, sg, c(2,:));
++    plot(gv, mu, 'o-', 'color', c(2,:), 'linewidth', 1.5, ...
++         'markersize', 4, 'markerfacecolor', c(2,:));
++    xlim([min(gv) max(gv)]);
++    if strcmp(kind, 'mul')
++        set(gca, 'xscale', 'log', 'xtick', tks, 'xticklabel', tick_labels(tks));
++    else
++        set(gca, 'xtick', tks);
++    end
++    hline(pd.t_covered);  vline(nom);
++
++    % strip along the bottom: how many realisations switched at all
++    yl = ylim;  yb = yl(1) - 0.09*diff(yl);
++    frac_bar(gv, frac, yb, c);
++    ylim([yb - 0.04*diff(yl), yl(2)]);
++
++    xlabel(lbl);
++    if mod(i-1, 3) == 0            % left column only, so the middle and right
++        ylabel('Switch time (s)');                    % panels keep their width
++    end
++    title(sprintf('(%c)   %s', 'A' + i - 1, name), 'interpreter', 'none');
++    set(gca, 'fontsize', 10); box off;
++
++    fprintf('    %-12s %-18s %s\n', name, range_str(kind, lo, hi), ...
++            fail_str(gv, frac, mean(pre,1), lo, hi));
++end
++end
++
++
++function fig10_sensitivity_joint()
++%FIG. 10  Parameter sensitivity with every parameter perturbed at once.
++%
++% Fig. 9 moves one parameter at a time, which cannot rule out that the switch
++% needs the rest of them held at their published values. Here all six are
++% drawn independently at random -- log-uniform over [1/MUL, MUL] for the
++% multiplicative ones, uniform over [-ADD, +ADD] for the additive ones, each
++% with its own noise realisation -- and the switch is re-detected. The
++% ranges are inside the single-parameter ranges of Fig. 9, so the question
++% is specifically whether the switch survives all six moving together.
++%
++% Panel B is the margin after covering, not a second test of the switch: it
++% comes out positive for every parameter set, including the few that are not
++% counted as switching. Those fail the other half of the definition -- M2 was
++% already ahead before the hand was covered -- which panel A counts and panel
++% B cannot show.
++NSAMP = 300;                       % random parameter sets
++MUL   = 2;                         % multiplicative parameters: x0.5 .. x2
++ADD   = 2;                         % additive (log-precision) ones: -2 .. +2
++
++spec = sensitivity_spec();
++nm   = size(spec,1);
++
++% Draw every random number up front: simulate() calls rng(p.seed), which
++% would otherwise reset the stream in the middle of the loop.
++rng(99);
++Uu    = rand(NSAMP, nm);
++seeds = randi(1000, NSAMP, 1);
++
++occ = false(NSAMP,1);  ts = nan(NSAMP,1);  mg = nan(NSAMP,1);
++for i = 1:NSAMP
++    p = default_params();  p.seed = seeds(i);
++    for k = 1:nm
++        if strcmp(spec{k,2}, 'mul')
++            v = MUL^(2*Uu(i,k) - 1);          % log-uniform in [1/MUL, MUL]
++        else
++            v = ADD*(2*Uu(i,k) - 1);          % uniform in [-ADD, +ADD]
++        end
++        p = perturb(p, spec{k,1}, v);
++    end
++    m = switch_metrics(p);
++    occ(i) = m.occurred;
++    mg(i)  = m.margin;
++    if m.occurred, ts(i) = m.t_switch; end
++    if mod(i, 100) == 0, fprintf('    %d/%d parameter sets\n', i, NSAMP); end
++end
++
++ref = switch_metrics(default_params());       % the published trial, for reference
++pct = 100 * mean(occ);
++fprintf('  Fig. 10  switch in %d/%d joint perturbations (%.1f%%)\n', ...
++        sum(occ), NSAMP, pct);
++fprintf('           switch time %.2f +/- %.2f s  (published %.2f s)\n', ...
++        mean(ts(occ)), std(ts(occ)), ref.t_switch);
++
++c = palette();
++figure(10); clf;
++set(gcf, 'position', [80 80 1100 460]);   % wide enough for the panel titles
++
++subplot(1,2,1); hold on;
++hist_bar(ts(occ), 20, c(2,:));
++vline(ref.t_switch);
++xlabel('Switch time (s)'); ylabel('Parameter sets');
++title(sprintf('(A)   switch in %.1f%% of %d\njoint perturbations', pct, NSAMP));
++set(gca, 'fontsize', 10); box off;
++
++subplot(1,2,2); hold on;
++hist_bar(mg, 20, c(2,:));
++vline(0);
++xlabel('U(M_1) - U(M_2) after covering'); ylabel('Parameter sets');
++title(sprintf('(B)   margin by which M_2 wins\nonce the hand is covered'));
++set(gca, 'fontsize', 10); box off;
++end
++
++
++function fig11_sensitivity_examples()
++%FIG. 11  Four parameters, four switches: the appendix version of Fig. 9.
++%
++% One column per parameter, each with that one parameter moved well away from
++% its published value and M1 and M2 exactly as published.
++%
++%   top row     the two hypotheses' posterior state uncertainty, as in Fig. 2,
++%               with the published trial underlaid in grey
++%   bottom row  their difference, d = U(M_1) - U(M_2). This row is what makes
++%               the switch legible: the two curves of the top row are only
++%               ~0.05 apart before covering but ~0.5 apart after it, so on a
++%               common axis the crossing itself is invisible. d > 0 means M_2
++%               is the experienced hypothesis, so the switch is the point
++%               where d crosses zero.
++%
++%         name          value  label
++cases = { 'k_lam',      0.5,   'k_\lambda \times 0.5'
++          'k_state',    0.25,  'k_x \times 0.25'
++          'eta_lam',    4,     '\eta_\lambda + 4'
++          'lam_cov_Av', 4,     '\lambda^{Av}_{covered} + 4' };
++nc = size(cases,1);
++
++pd  = default_params();
++ref = switch_metrics(pd);
++c   = palette();
++
++figure(11); clf;
++set(gcf, 'position', [80 80 1400 620]);   % four columns of axes
++for i = 1:nc
++    m = switch_metrics(perturb(default_params(), cases{i,1}, cases{i,2}));
++    if m.occurred
++        ttl = sprintf('(%c)   %s\nswitch at %.2f s', 'A'+i-1, cases{i,3}, m.t_switch);
++    else
++        ttl = sprintf('(%c)   %s\nno switch', 'A'+i-1, cases{i,3});
++    end
++
++    % ---- top row: the two hypotheses --------------------------------------
++    subplot(2, nc, i); hold on;
++    ps = get(gca, 'position');     % headroom for the two-line title
++    set(gca, 'position', [ps(1), ps(2), ps(3), 0.86*ps(4)]);
++    h0 = plot(ref.t, ref.U1, ':', 'color', [0.6 0.6 0.6], 'linewidth', 1);
++    plot(ref.t, ref.U2, ':', 'color', [0.6 0.6 0.6], 'linewidth', 1, ...
++         'handlevisibility', 'off');
++    h1 = plot(m.t, m.U1, 'color', c(1,:), 'linewidth', 1.2);
++    h2 = plot(m.t, m.U2, 'color', c(2,:), 'linewidth', 1.2);
++    vline(pd.t_covered);
++    xlim([0 pd.T]);
++    % No tick labels on the top row: the bottom row carries the time axis, and
++    % in four columns the labels of the two rows would otherwise run together.
++    set(gca, 'xtick', 0:10:30, 'xticklabel', []);
++    title(ttl); set(gca, 'fontsize', 10); box off;
++    if i == 1
++        % Shortened from "posterior state uncertainty": at a quarter of the
++        % width and half the height of the figure, the full wording is taller
++        % than the axes it belongs to.
++        ylabel('Posterior uncertainty');
++        legend([h1 h2 h0], {'M_1', 'M_2', 'published'}, ...
++               'location', 'northwest', 'fontsize', 8);
++    end
++
++    % ---- bottom row: which hypothesis is experienced -----------------------
++    subplot(2, nc, nc + i); hold on;
++    plot(ref.t, ref.d, ':', 'color', [0.6 0.6 0.6], 'linewidth', 1);
++    plot(m.t, m.d, 'color', c(4,:), 'linewidth', 1.2);
++    hline(0); vline(pd.t_covered);
++    if m.occurred
++        plot(m.t_switch, 0, 'kv', 'markerfacecolor', 'k', 'markersize', 6);
++    end
++    xlim([0 pd.T]);
++    set(gca, 'xtick', 0:10:30);
++    xlabel('Time (s)'); set(gca, 'fontsize', 10); box off;
++    if i == 1, ylabel('U(M_1) - U(M_2)'); end
++end
++end
++
++
+ % =========================================================================
+ %  PLOTTING HELPERS
+ % =========================================================================
+@@ -521,6 +913,138 @@ plot(x, y*ones(1, numel(x)), 's', 'markersize', 4, 'markerfacecolor', col, ...
+      'markeredgecolor', col);
+ end
+ 
++function h = band(x, mu, sg, col)
++%BAND  Shaded +/-1 s.d. ribbon, broken wherever mu is NaN (Fig. 9).
++%   Returns a handle to the first patch so it can be named in a legend.
++h  = [];
++ok = ~isnan(mu) & ~isnan(sg);
++i  = 1;
++while i <= numel(ok)
++    if ~ok(i), i = i + 1; continue, end
++    j = i;
++    while j < numel(ok) && ok(j+1), j = j + 1; end
++    if j > i
++        xx = x(i:j);  m = mu(i:j);  s = sg(i:j);
++        p = fill([xx fliplr(xx)], [m+s fliplr(m-s)], col, 'facealpha', 0.2, ...
++                 'edgecolor', 'none', 'handlevisibility', 'off');
++        if isempty(h), h = p; end
++    end
++    i = j + 1;
++end
++if isempty(h)                      % nothing to shade: keep a legend handle
++    h = fill(NaN, NaN, col, 'facealpha', 0.2, 'edgecolor', 'none', ...
++             'handlevisibility', 'off');
++end
++end
++
++
++function frac_bar(x, frac, y, c)
++%FRAC_BAR  Bottom strip of Fig. 9: in how many noise realisations the switch
++%          occurred. Filled square = all of them, hollow = some, cross = none.
++for i = 1:numel(x)
++    if frac(i) == 1
++        plot(x(i), y, 's', 'markersize', 5, 'markerfacecolor', c(2,:), ...
++             'markeredgecolor', c(2,:), 'handlevisibility', 'off');
++    elseif frac(i) > 0
++        plot(x(i), y, 's', 'markersize', 5, 'markerfacecolor', 'none', ...
++             'markeredgecolor', c(2,:), 'handlevisibility', 'off');
++    else
++        plot(x(i), y, 'x', 'markersize', 5, 'color', [0.5 0.5 0.5], ...
++             'handlevisibility', 'off');
++    end
++end
++end
++
++
++function hist_bar(x, nb, col)
++%HIST_BAR  Histogram of x in nb bins. The counting is done by hand so that
++%          the file keeps to the same MATLAB baseline as the rest of it.
++x = x(~isnan(x));
++if isempty(x), return, end
++lo = min(x);  hi = max(x);
++if hi == lo, hi = lo + 1; end
++e = linspace(lo, hi, nb+1);
++n = zeros(1, nb);
++for b = 1:nb
++    n(b) = sum(x >= e(b) & x < e(b+1));
++end
++n(nb) = n(nb) + sum(x == e(end));
++bar(0.5*(e(1:end-1) + e(2:end)), n, 1, 'facecolor', col, 'edgecolor', 'w');
++end
++
++
++function lbl = tick_labels(tks)
++%TICK_LABELS  Compact labels for a logarithmic sweep axis (Fig. 9): powers of
++%   ten as exponents once they would otherwise be long, the rest as plain
++%   numbers, so that 0.25 does not come out as 2.5\times10^{-1}.
++lbl = cell(1, numel(tks));
++for i = 1:numel(tks)
++    e = log10(tks(i));
++    if abs(e - round(e)) < 1e-9 && abs(e) >= 2
++        lbl{i} = sprintf('10^{%d}', round(e));
++    else
++        lbl{i} = sprintf('%g', tks(i));
++    end
++end
++end
++
++
++function [lo, hi] = robust_range(gv, frac, nom)
++%ROBUST_RANGE  Widest contiguous stretch of grid values that contains the
++%              published one and over which every realisation switched.
++lo = NaN;  hi = NaN;
++i0 = find(abs(gv - nom) < 1e-12, 1);
++if isempty(i0) || frac(i0) < 1, return, end
++a = i0;  while a > 1           && frac(a-1) == 1, a = a - 1; end
++b = i0;  while b < numel(frac) && frac(b+1) == 1, b = b + 1; end
++lo = gv(a);  hi = gv(b);
++end
++
++
++function s = fail_str(gv, frac, fpre, lo, hi)
++%FAIL_STR  How the switch first breaks down on either side of the robust
++%          range of Fig. 9.
++%   Two failures are possible and they mean different things: the switch can
++%   go missing, or M2 can already be ahead while the hand is still visible --
++%   in which case the agent is illusory from the start rather than switching.
++s = '';
++if isnan(lo), return, end
++
++i = find(gv < lo & frac < 1);                  % nearest failure below
++if ~isempty(i)
++    s = sprintf('breaks at %g (%s)', gv(i(end)), fail_mode(fpre(i(end))));
++end
++j = find(gv > hi & frac < 1, 1);               % nearest failure above
++if ~isempty(j)
++    if ~isempty(s), s = [s '; ']; end
++    s = [s sprintf('breaks at %g (%s)', gv(j), fail_mode(fpre(j)))];
++end
++if isempty(s), s = 'no failure in the swept range'; end
++end
++
++
++function s = fail_mode(fp)
++%FAIL_MODE  Name the failure: illusory from the start, or never illusory.
++if fp < 1
++    s = 'M2 already ahead before covering';
++else
++    s = 'switch absent';
++end
++end
++
++
++function s = range_str(kind, lo, hi)
++%RANGE_STR  Format a robust range for the console summary of Fig. 9.
++if isnan(lo)
++    s = 'switch absent at the published value';
++elseif strcmp(kind, 'mul')
++    s = sprintf('x%g to x%g', lo, hi);
++else
++    s = sprintf('%+g to %+g', lo, hi);
++end
++end
++
++
+ function idx = tsel(t, t0, t1)
+ %TSEL  Indices of t inside [t0, t1], robust to floating-point time steps.
+ idx = find(t >= t0 - 1e-9 & t <= t1 + 1e-9);
+-- 
+2.43.0
+
+
+From f631a7c30999f907287c6518d5450fc996f717d9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 17 Aug 2026 14:19:31 +0000
+Subject: [PATCH 2/3] Simplify Fig. 9 to four parameters against their own
+ values
+
+Fig. 9 now plots each parameter's own value on the x-axis instead of a
+multiple of the published one, with a dashed line marking the value used in
+the paper simulations; which values those are is stated in the figure's
+description rather than on the axes.
+
+  - four panels (k_lam, eta_lam, P_lam(Av), lam_covered(Av)) instead of six.
+    k_state and P_X are dropped because they provably do nothing near their
+    paper values: expm(K_X*H*dt) has already underflowed to zero, so the state
+    update is the exact Newton step, and P_X = 1 is added to an M'*Pz*M whose
+    entries are of order 1e3. Fig. 10 still perturbs all six.
+  - one trial per point at the paper's noise realisation, plotted only where
+    the switch occurs, so a curve that stops marks a value at which the
+    illusion no longer arises
+  - removed the across-seed ribbon and the bottom strip of markers
+  - x-limits stop one grid step past the last switching point, so sweeps that
+    deliberately run ten decades do not leave most of the axis blank
+  - panel titles name the parameter's role, axes carry the symbol, ticks are
+    set explicitly, y-labels only on the left column: nothing overlaps
+
+Note the k_lam limit at ~11 that the ten-realisation version reported is not
+visible in a single-trial figure -- above it M2 gets ahead before covering in
+about half of the realisations, not all. This is recorded in the README.
+
+Figs. 2-8 remain bit-identical across 24 configurations; Figs. 10 and 11 are
+unchanged.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UfwYpwGVozHGhaYv68cWf3
+---
+ README.md       |  59 ++++++++------
+ precision_RHI.m | 203 +++++++++++++++++++-----------------------------
+ 2 files changed, 116 insertions(+), 146 deletions(-)
+
+diff --git a/README.md b/README.md
+index 5d6f4de..f44802b 100644
+--- a/README.md
++++ b/README.md
+@@ -48,7 +48,7 @@ precision_RHI(2,5,8)   % just these
+ ```
+ 
+ Figures 2-8 take ~30 s. Figures 9-11 sweep the parameters and re-run the
+-trial a few thousand times, which adds a couple of minutes; ask for
++trial several hundred times, which roughly doubles that; ask for
+ `precision_RHI(2:8)` to skip them.
+ 
+ For a single condition:
+@@ -70,7 +70,7 @@ s = f.simulate(p);       plot(s.t, s.Xh(4,:))
+ | 6 | drift appears under `M2`, not under `M1` |
+ | 7 | a farther rubber hand gives a larger drift |
+ | 8 | drift vs. distance and susceptibility `α` |
+-| 9 | the switch survives each parameter being scaled or biased, and where it stops |
++| 9 | when the switch happens as each of four parameters is varied, and where it stops |
+ | 10 | ... and survives all of them being perturbed at once |
+ | 11 | four parameters, four switches, side by side |
+ 
+@@ -87,29 +87,38 @@ as published, and the switch is detected again — `switch_metrics` requires
+ take over for at least a second once the hand is covered, so a model that was
+ illusory from the start does not count as having switched.
+ 
+-In Fig. 9 the line is the mean switch time over 10 noise realisations and the
+-ribbon is ±1 s.d.; the strip along the bottom of each panel marks grid points
+-where every realisation switched (filled square), only some did (hollow) or
+-none did (grey cross). Fig. 11 adds a second row showing `U(M1) - U(M2)`,
+-because the two uncertainty curves are only ~0.05 apart before covering and
+-~0.5 apart after it, so on a shared axis the crossing itself is invisible.
+-
+-The switch is preserved over a wide range of every parameter, and it also has
+-limits, which are as informative as the robustness:
+-
+-| | |
+-|---|---|
+-| `k_lam` above ~2.8× | `M2` gets ahead *before* the hand is covered — a fast enough precision learner is illusory from the start |
+-| `P_lam` on `Av` above ~1e3× | the agent cannot revise its estimate of visual reliability, so no switch — the continuous version of Fig. 4 |
+-| `lam_covered` on `Av` above ~+7 | the occlusion is too mild to register as a precision change |
+-| `k_state` below ~0.01×, `P_X` above ~100× | state estimation is too slow, resp. the state prior swamps the sensory evidence |
+-
+-Note that `k_state` and `P_X` do nothing at all near their published values,
+-and this is not a numerical accident: `expm(K_X*H*p.dt)` in `simulate` has
+-already underflowed to zero there, so the state update *is* the exact Newton
+-step and its gain cannot matter, and `P_X = 1` is added to an `M'*Pz*M` whose
+-entries are of order `1e3`. Both need sweeping over orders of magnitude before
+-they bite, which is what `sensitivity_spec` does.
++Fig. 9 plots each parameter against its own value, with the dashed vertical
++line at the value used for the paper simulations. A point appears only where
++the switch actually occurs, so a curve that stops has reached a value at which
++the illusion no longer arises. One trial per point, at the paper's noise
++realisation. Fig. 11 adds a second row showing `U(M1) - U(M2)`, because the two
++uncertainty curves are only ~0.05 apart before covering and ~0.5 apart after
++it, so on a shared axis the crossing itself is invisible.
++
++| parameter | paper | switches over | stops at |
++|---|---|---|---|
++| `k_lam` | 4 | 1 – 16 | not reached in this range |
++| `eta_lam` | 10 | 6 – 14 | not reached in this range |
++| `P_lam` on `Av` | `exp(-4)` ≈ 0.018 | 1.8e-4 – 1.8 | 18.3 — the agent can no longer revise its estimate of visual reliability, the continuous version of Fig. 4 |
++| `lam_covered` on `Av` | −1 | −5 – +5 | +7 — the occlusion is too mild to register as a precision change (`lam_visible` is 9) |
++
++The switch time moves by well under a second across most of these ranges, and
++rises towards the limit in the last two: making the `Av` precision prior
++stronger, or the occlusion milder, delays the illusion before abolishing it.
++
++`k_state` and `P_X` are not panels here because they do nothing near their
++paper values, and not by numerical accident: `expm(K_X*H*p.dt)` in `simulate`
++has already underflowed to zero there, so the state update *is* the exact
++Newton step and its gain cannot matter, and `P_X = 1` is added to an `M'*Pz*M`
++whose entries are of order `1e3`. Fig. 10 still perturbs both along with the
++other four.
++
++One caveat on reading Fig. 9: a single noise realisation cannot separate a
++limit of the model from a limit of that realisation. Sweeping `k_lam` over ten
++realisations instead of one puts a limit at ~11, above which `M2` gets ahead
++*before* the hand is covered in about half of them — a fast enough precision
++learner is illusory from the start. That limit is invisible in a single-trial
++figure.
+ 
+ ## Code layout
+ 
+diff --git a/precision_RHI.m b/precision_RHI.m
+index 8c1266a..a955171 100644
+--- a/precision_RHI.m
++++ b/precision_RHI.m
+@@ -502,17 +502,20 @@ function spec = sensitivity_spec()
+ % it is negligible unless raised by orders of magnitude. Sweeping either over
+ % two octaves would produce a flat line for an uninteresting reason.
+ %
+-% The last column gives the tick positions explicitly. Several of the grids
+-% span eight or more decades, and letting MATLAB label every one of them puts
+-% the tick labels on top of each other in a subplot this size.
++% Columns 4-7 are for plotting rather than for the sweep itself. Fig. 9 draws
++% each parameter against its own value, so it needs the value the paper uses
++% (column 5) to turn a perturbation into an absolute one, and explicit tick
++% positions in those same absolute units (column 4) -- several of the grids
++% span eight or more decades, and letting MATLAB label every decade puts the
++% tick labels on top of each other in a subplot this size.
+ %
+-%        name          kind   sweep grid       axis label                        ticks
+-spec = { 'k_lam',      'mul', 2.^(-2:0.5:2),  'k_\lambda  (\times published)',   [0.25 0.5 1 2 4]
+-         'k_state',    'mul', 10.^(-5:2),     'k_x  (\times published)',         10.^(-5:2:1)
+-         'P_X',        'mul', 10.^(-2:8),     'P_x  (\times published)',         10.^(-2:2:8)
+-         'eta_lam',    'add', -4:4,           '\eta_\lambda  (bias)',            -4:2:4
+-         'P_lam_Av',   'mul', 10.^(-2:8),     'P_\lambda^{Av}  (\times published)', 10.^(-2:2:8)
+-         'lam_cov_Av', 'add', -4:2:12,        '\lambda^{Av}_{covered}  (bias)',  -4:4:12 };
++%        name          kind   sweep grid      ticks (absolute)  paper value  symbol                     description
++spec = { 'k_lam',      'mul', 2.^(-2:0.5:2),  [1 2 4 8 16],     4,           'k_\lambda',                'precision learning rate'
++         'k_state',    'mul', 10.^(-5:2),     10.^(-4:2:2),     4,           'k_x',                      'state learning rate'
++         'P_X',        'mul', 10.^(-2:8),     10.^(-2:2:8),     1,           'P_x',                      'prior precision on the states'
++         'eta_lam',    'add', -4:4,           6:2:14,           10,          '\eta_\lambda',             'prior mean on \lambda'
++         'P_lam_Av',   'mul', 10.^(-2:8),     10.^(-3:1:1),     exp(-4),     'P_\lambda^{Av}',           'prior precision on \lambda^{Av}'
++         'lam_cov_Av', 'add', -4:2:12,        -4:2:6,           -1,          '\lambda^{Av}_{covered}',   '\lambda^{Av} once the hand is covered' };
+ end
+ 
+ 
+@@ -606,67 +609,77 @@ end
+ 
+ 
+ function fig9_sensitivity_sweep()
+-%FIG. 9  Parameter sensitivity, one parameter at a time.
++%FIG. 9  Parameter sensitivity: when the switch happens as a parameter varies.
+ %
+-% Each panel scales or biases a single free parameter away from its published
+-% value and re-detects the switch, over NSEED noise realisations. The line is
+-% the mean switch time, the ribbon +/- 1 s.d.; the strip along the bottom says
+-% whether every realisation switched (filled square), some did (hollow) or
+-% none did (grey cross). M1 and M2 are unchanged throughout.
++% One panel per parameter, four parameters, and one trial per point. Each
++% x-axis is the parameter's own value -- not a multiple of anything -- and the
++% dashed vertical line marks the value used for the paper simulations
++% (Appendix 5.1):
+ %
+-% The band is named in the y-label rather than in a legend: the curve runs
+-% through the middle of each panel, so any legend box inside the axes would
+-% sit on top of it.
+-NSEED = 10;                        % noise realisations per grid point
++%   k_lambda = 4     eta_lambda = 10     P_lambda^Av = exp(-4) = 0.0183
++%   lambda^Av_covered = -1     (against lambda^Av = 9 while the hand is visible)
++%
++% A point is plotted only where the switch actually occurs, so a gap in a
++% curve is a range over which the illusion does not arise at all; the console
++% summary names the value at which it stops and which half of the definition
++% fails there. M1 and M2 (Eqs. 3 and 4) are unchanged in every panel -- only
++% these four numbers move.
++%
++% k_x and P_x are left out because they do nothing near their paper values:
++% expm(K_X*H*p.dt) in simulate has already underflowed to zero, so the state
++% update is exactly the Newton step and its gain cannot matter, and P_x = 1 is
++% added to an M'*Pz*M whose entries are of order 1e3. Fig. 10 still perturbs
++% them along with the rest.
++PANELS = {'k_lam', 'eta_lam', 'P_lam_Av', 'lam_cov_Av'};
+ 
+ spec = sensitivity_spec();
+ pd   = default_params();
+ c    = palette();
+ 
+ figure(9); clf;
+-set(gcf, 'position', [80 80 1280 720]);   % room for six sets of axis labels
+-fprintf('  Fig. 9  switch preserved for every noise realisation over:\n');
+-for i = 1:size(spec,1)
+-    name = spec{i,1};  kind = spec{i,2};  gv = spec{i,3};
+-    lbl  = spec{i,4};  tks  = spec{i,5};
+-    ng   = numel(gv);
+-
+-    ts  = nan(NSEED, ng);
+-    occ = false(NSEED, ng);
+-    pre = false(NSEED, ng);
+-    for j = 1:ng
+-        for k = 1:NSEED
+-            p = default_params();
+-            p.seed = k;
+-            m = switch_metrics(perturb(p, name, gv(j)));
+-            occ(k,j) = m.occurred;
+-            pre(k,j) = m.pre_M1;
+-            ts(k,j)  = m.t_switch;
+-        end
++set(gcf, 'position', [80 80 900 700]);
++fprintf('  Fig. 9  switch occurs over:\n');
++for i = 1:numel(PANELS)
++    k    = find(strcmp(spec(:,1), PANELS{i}), 1);
++    name = spec{k,1};  kind = spec{k,2};  gv  = spec{k,3};
++    tks  = spec{k,4};  nom  = spec{k,5};  sym = spec{k,6};  desc = spec{k,7};
++
++    % The parameter's own value at each point of the sweep: the multiplicative
++    % parameters scale their paper value, the log-precisions are offset from it.
++    if strcmp(kind, 'mul'), av = nom * gv; else, av = nom + gv; end
++
++    ts  = nan(1, numel(gv));
++    occ = false(1, numel(gv));
++    pre = false(1, numel(gv));
++    for j = 1:numel(gv)
++        m = switch_metrics(perturb(default_params(), name, gv(j)));
++        occ(j) = m.occurred;
++        pre(j) = m.pre_M1;
++        if m.occurred, ts(j) = m.t_switch; end   % NaN elsewhere breaks the line
+     end
++    [lo, hi] = robust_range(av, double(occ), nom);
+ 
+-    % Mean and s.d. of the switch time over the realisations that switched.
+-    mu = nan(1,ng);  sg = nan(1,ng);
+-    for j = 1:ng
+-        v = ts(occ(:,j), j);
+-        if ~isempty(v), mu(j) = mean(v); sg(j) = std(v); end
+-    end
+-    frac     = mean(occ, 1);
+-    nom      = pick(strcmp(kind,'mul'), 1, 0);
+-    [lo, hi] = robust_range(gv, frac, nom);
+-
+-    subplot(2, 3, i); hold on;
++    subplot(2, 2, i); hold on;
+ 
+-    % Shrink each set of axes upwards a little. The x-labels carry
+-    % superscripts and subscripts, which are tall enough that at the default
+-    % 2x3 spacing the top row's label lands on the bottom row's title.
++    % Shrink each set of axes upwards. The x-labels carry superscripts and
++    % subscripts, tall enough that at the default 2x2 spacing the top row's
++    % label would land on the bottom row's title.
+     ps = get(gca, 'position');
+-    set(gca, 'position', [ps(1), ps(2) + 0.11*ps(4), ps(3), 0.76*ps(4)]);
+-
+-    band(gv, mu, sg, c(2,:));
+-    plot(gv, mu, 'o-', 'color', c(2,:), 'linewidth', 1.5, ...
+-         'markersize', 4, 'markerfacecolor', c(2,:));
+-    xlim([min(gv) max(gv)]);
++    set(gca, 'position', [ps(1), ps(2) + 0.09*ps(4), ps(3), 0.82*ps(4)]);
++
++    plot(av, ts, 'o-', 'color', c(2,:), 'linewidth', 1.5, ...
++         'markersize', 5, 'markerfacecolor', c(2,:));
++
++    % Show one grid step past the outermost value that still switches. The
++    % sweeps deliberately run well beyond the switch to find its limits, and
++    % plotting all of that would leave most of the axis blank -- P_lambda^Av is
++    % swept over ten decades and switches over the first four of them.
++    on = find(occ);
++    if isempty(on)
++        xlim([min(av) max(av)]);
++    else
++        xlim([av(max(1, min(on)-1)), av(min(numel(av), max(on)+1))]);
++    end
+     if strcmp(kind, 'mul')
+         set(gca, 'xscale', 'log', 'xtick', tks, 'xticklabel', tick_labels(tks));
+     else
+@@ -674,20 +687,13 @@ for i = 1:size(spec,1)
+     end
+     hline(pd.t_covered);  vline(nom);
+ 
+-    % strip along the bottom: how many realisations switched at all
+-    yl = ylim;  yb = yl(1) - 0.09*diff(yl);
+-    frac_bar(gv, frac, yb, c);
+-    ylim([yb - 0.04*diff(yl), yl(2)]);
++    xlabel(sym);
++    if mod(i, 2) == 1, ylabel('Switch time (s)'); end   % left column only
++    title(sprintf('(%c)   %s', 'A' + i - 1, desc));
++    set(gca, 'fontsize', 11); box off;
+ 
+-    xlabel(lbl);
+-    if mod(i-1, 3) == 0            % left column only, so the middle and right
+-        ylabel('Switch time (s)');                    % panels keep their width
+-    end
+-    title(sprintf('(%c)   %s', 'A' + i - 1, name), 'interpreter', 'none');
+-    set(gca, 'fontsize', 10); box off;
+-
+-    fprintf('    %-12s %-18s %s\n', name, range_str(kind, lo, hi), ...
+-            fail_str(gv, frac, mean(pre,1), lo, hi));
++    fprintf('    %-12s %-24s (paper %-9g) %s\n', name, range_str(lo, hi), nom, ...
++            fail_str(av, double(occ), double(pre), lo, hi));
+ end
+ end
+ 
+@@ -913,49 +919,6 @@ plot(x, y*ones(1, numel(x)), 's', 'markersize', 4, 'markerfacecolor', col, ...
+      'markeredgecolor', col);
+ end
+ 
+-function h = band(x, mu, sg, col)
+-%BAND  Shaded +/-1 s.d. ribbon, broken wherever mu is NaN (Fig. 9).
+-%   Returns a handle to the first patch so it can be named in a legend.
+-h  = [];
+-ok = ~isnan(mu) & ~isnan(sg);
+-i  = 1;
+-while i <= numel(ok)
+-    if ~ok(i), i = i + 1; continue, end
+-    j = i;
+-    while j < numel(ok) && ok(j+1), j = j + 1; end
+-    if j > i
+-        xx = x(i:j);  m = mu(i:j);  s = sg(i:j);
+-        p = fill([xx fliplr(xx)], [m+s fliplr(m-s)], col, 'facealpha', 0.2, ...
+-                 'edgecolor', 'none', 'handlevisibility', 'off');
+-        if isempty(h), h = p; end
+-    end
+-    i = j + 1;
+-end
+-if isempty(h)                      % nothing to shade: keep a legend handle
+-    h = fill(NaN, NaN, col, 'facealpha', 0.2, 'edgecolor', 'none', ...
+-             'handlevisibility', 'off');
+-end
+-end
+-
+-
+-function frac_bar(x, frac, y, c)
+-%FRAC_BAR  Bottom strip of Fig. 9: in how many noise realisations the switch
+-%          occurred. Filled square = all of them, hollow = some, cross = none.
+-for i = 1:numel(x)
+-    if frac(i) == 1
+-        plot(x(i), y, 's', 'markersize', 5, 'markerfacecolor', c(2,:), ...
+-             'markeredgecolor', c(2,:), 'handlevisibility', 'off');
+-    elseif frac(i) > 0
+-        plot(x(i), y, 's', 'markersize', 5, 'markerfacecolor', 'none', ...
+-             'markeredgecolor', c(2,:), 'handlevisibility', 'off');
+-    else
+-        plot(x(i), y, 'x', 'markersize', 5, 'color', [0.5 0.5 0.5], ...
+-             'handlevisibility', 'off');
+-    end
+-end
+-end
+-
+-
+ function hist_bar(x, nb, col)
+ %HIST_BAR  Histogram of x in nb bins. The counting is done by hand so that
+ %          the file keeps to the same MATLAB baseline as the rest of it.
+@@ -1033,14 +996,12 @@ end
+ end
+ 
+ 
+-function s = range_str(kind, lo, hi)
+-%RANGE_STR  Format a robust range for the console summary of Fig. 9.
++function s = range_str(lo, hi)
++%RANGE_STR  Format a range of parameter values for the summary of Fig. 9.
+ if isnan(lo)
+-    s = 'switch absent at the published value';
+-elseif strcmp(kind, 'mul')
+-    s = sprintf('x%g to x%g', lo, hi);
++    s = 'no switch at the paper value';
+ else
+-    s = sprintf('%+g to %+g', lo, hi);
++    s = sprintf('%g to %g', lo, hi);
+ end
+ end
+ 
+-- 
+2.43.0
+
+
+From 2e3cd4cf186d7d79e0d4f9a030ef716320fd709f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 17 Aug 2026 14:28:34 +0000
+Subject: [PATCH 3/3] Give Fig. 9 explicit axes positions so nothing overlaps
+
+subplot(2,2,...) leaves too little room between the rows for x-labels that
+carry superscripts and subscripts, so the top row's label touched the bottom
+row's title. The four axes are now positioned by hand with roughly twice that
+gap between rows, and the margins are sized for what sits outside the axes:
+the y-label on the left, the centred titles above (a long one overflows to the
+right of its own column), and the x-label subscripts, which hang lower than
+the tick labels.
+
+Also shortened the lam_covered panel title, which was long enough to run past
+the right edge of the figure.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UfwYpwGVozHGhaYv68cWf3
+---
+ precision_RHI.m | 25 ++++++++++++++++---------
+ 1 file changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/precision_RHI.m b/precision_RHI.m
+index a955171..81ab660 100644
+--- a/precision_RHI.m
++++ b/precision_RHI.m
+@@ -515,7 +515,7 @@ spec = { 'k_lam',      'mul', 2.^(-2:0.5:2),  [1 2 4 8 16],     4,           'k_
+          'P_X',        'mul', 10.^(-2:8),     10.^(-2:2:8),     1,           'P_x',                      'prior precision on the states'
+          'eta_lam',    'add', -4:4,           6:2:14,           10,          '\eta_\lambda',             'prior mean on \lambda'
+          'P_lam_Av',   'mul', 10.^(-2:8),     10.^(-3:1:1),     exp(-4),     'P_\lambda^{Av}',           'prior precision on \lambda^{Av}'
+-         'lam_cov_Av', 'add', -4:2:12,        -4:2:6,           -1,          '\lambda^{Av}_{covered}',   '\lambda^{Av} once the hand is covered' };
++         'lam_cov_Av', 'add', -4:2:12,        -4:2:6,           -1,          '\lambda^{Av}_{covered}',   'visual precision when covered' };
+ end
+ 
+ 
+@@ -632,12 +632,24 @@ function fig9_sensitivity_sweep()
+ % them along with the rest.
+ PANELS = {'k_lam', 'eta_lam', 'P_lam_Av', 'lam_cov_Av'};
+ 
++% The axes are placed by hand rather than by subplot. The x-labels carry
++% superscripts and subscripts and the titles are full phrases, and at the
++% spacing subplot(2,2,...) uses the top row's label runs into the bottom row's
++% title. AX_Y leaves roughly twice that gap between the two rows.
++% The margins are set by what sits outside the axes: the y-label on the left,
++% the titles above (centred, so a long one overflows to the right of its
++% column), and the x-labels below, whose subscripts hang lower than the tick
++% labels do.
++AX_W = 0.355;  AX_H = 0.285;
++AX_X = [0.115, 0.585];             % left edges:    columns 1 and 2
++AX_Y = [0.615, 0.105];             % bottom edges:  top row, then bottom row
++
+ spec = sensitivity_spec();
+ pd   = default_params();
+ c    = palette();
+ 
+ figure(9); clf;
+-set(gcf, 'position', [80 80 900 700]);
++set(gcf, 'position', [80 80 920 760]);
+ fprintf('  Fig. 9  switch occurs over:\n');
+ for i = 1:numel(PANELS)
+     k    = find(strcmp(spec(:,1), PANELS{i}), 1);
+@@ -659,13 +671,8 @@ for i = 1:numel(PANELS)
+     end
+     [lo, hi] = robust_range(av, double(occ), nom);
+ 
+-    subplot(2, 2, i); hold on;
+-
+-    % Shrink each set of axes upwards. The x-labels carry superscripts and
+-    % subscripts, tall enough that at the default 2x2 spacing the top row's
+-    % label would land on the bottom row's title.
+-    ps = get(gca, 'position');
+-    set(gca, 'position', [ps(1), ps(2) + 0.09*ps(4), ps(3), 0.82*ps(4)]);
++    axes('position', [AX_X(mod(i-1,2) + 1), AX_Y(ceil(i/2)), AX_W, AX_H]);
++    hold on;
+ 
+     plot(av, ts, 'o-', 'color', c(2,:), 'linewidth', 1.5, ...
+          'markersize', 5, 'markerfacecolor', c(2,:));
+-- 
+2.43.0
+
